@@ -2,7 +2,10 @@
 //! shared cache when not already present — and execs it with the given args.
 
 use bun_collections::VecExt;
-use std::io::Write as _;
+use std::collections::VecDeque;
+use std::io::{Read as _, Write as _};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use bstr::BStr;
 
@@ -26,6 +29,8 @@ use bun_sys::FdExt as _;
 use bun_sys::{self, Fd, FdDirExt as _, O};
 use bun_wyhash::hash;
 use std::env::consts::EXE_SUFFIX;
+use std::path::{Path, PathBuf};
+use std::process as std_process;
 
 use crate::api::bun::process::Status as SpawnStatus;
 use crate::api::bun::process::sync as proc_sync;
@@ -592,6 +597,872 @@ impl BunxCommand {
         true
     }
 
+    const RESILIENCE_DB_MAGIC: &'static [u8; 8] = b"BUNXRS01";
+    const MAX_CAPTURED_STDERR: usize = 64 * 1024;
+    const DEFAULT_MAX_PARALLEL_RESILIENCE_INSTALLS: usize = 10;
+
+    fn exit_status_code(status: std_process::ExitStatus) -> u32 {
+        status
+            .code()
+            .and_then(|code| u32::try_from(code).ok())
+            .unwrap_or(1)
+    }
+
+    fn max_parallel_resilience_installs() -> usize {
+        std::env::var("BUNX_RESILIENCE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(64))
+            .unwrap_or(Self::DEFAULT_MAX_PARALLEL_RESILIENCE_INSTALLS)
+    }
+
+    fn bunx_home_dir() -> Option<PathBuf> {
+        if let Some(home) = std::env::var_os("BUNX_HOME") {
+            if !home.is_empty() {
+                return Some(PathBuf::from(home));
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            std::env::var_os("USERPROFILE").map(PathBuf::from)
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::var_os("HOME").map(PathBuf::from)
+        }
+    }
+
+    fn project_hash() -> u64 {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        hash(cwd.to_string_lossy().as_bytes())
+    }
+
+    fn node_path_with_bunx_cache(cache_node_modules: &Path) -> std::ffi::OsString {
+        let mut paths = Vec::new();
+        paths.push(cache_node_modules.to_path_buf());
+        if let Some(existing) = std::env::var_os("NODE_PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        std::env::join_paths(paths).unwrap_or_else(|_| cache_node_modules.as_os_str().to_owned())
+    }
+
+    fn is_bare_module_specifier(module: &[u8]) -> bool {
+        !module.is_empty()
+            && !module.starts_with(b".")
+            && !module.starts_with(b"/")
+            && !module.starts_with(b"node:")
+            && !module.contains(&0)
+    }
+
+    fn package_name_from_specifier(module: &[u8]) -> Option<Vec<u8>> {
+        if !Self::is_bare_module_specifier(module) {
+            return None;
+        }
+
+        if module.starts_with(b"@") {
+            let slash = module.iter().position(|b| *b == b'/')?;
+            let rest = &module[slash + 1..];
+            if rest.is_empty() {
+                return None;
+            }
+            let end = rest
+                .iter()
+                .position(|b| *b == b'/')
+                .map(|index| slash + 1 + index)
+                .unwrap_or(module.len());
+            return Some(module[..end].to_vec());
+        }
+
+        let end = module
+            .iter()
+            .position(|b| *b == b'/')
+            .unwrap_or(module.len());
+        if end == 0 {
+            None
+        } else {
+            Some(module[..end].to_vec())
+        }
+    }
+
+    fn push_unique_module(modules: &mut Vec<Vec<u8>>, module: &[u8]) {
+        if let Some(package_name) = Self::package_name_from_specifier(module) {
+            if !modules.iter().any(|existing| existing == &package_name) {
+                modules.push(package_name);
+            }
+        }
+    }
+
+    fn scan_string_literal_after<'a>(source: &'a [u8], start: usize) -> Option<(&'a [u8], usize)> {
+        let quote = *source.get(start)?;
+        if quote != b'\'' && quote != b'"' {
+            return None;
+        }
+
+        let mut i = start + 1;
+        while i < source.len() {
+            match source[i] {
+                b'\\' => i = i.saturating_add(2),
+                byte if byte == quote => return Some((&source[start + 1..i], i + 1)),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    fn skip_ascii_space(source: &[u8], mut i: usize) -> usize {
+        while i < source.len() && source[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    fn scan_static_bare_imports(source: &[u8]) -> Vec<Vec<u8>> {
+        let mut modules = Vec::new();
+        let mut i = 0;
+        while i < source.len() {
+            if source[i] == b'\'' || source[i] == b'"' {
+                if let Some((_, next)) = Self::scan_string_literal_after(source, i) {
+                    i = next;
+                    continue;
+                }
+            }
+
+            if source[i..].starts_with(b"require") {
+                let mut cursor = Self::skip_ascii_space(source, i + b"require".len());
+                if source.get(cursor) == Some(&b'(') {
+                    cursor = Self::skip_ascii_space(source, cursor + 1);
+                    if let Some((specifier, next)) = Self::scan_string_literal_after(source, cursor)
+                    {
+                        Self::push_unique_module(&mut modules, specifier);
+                        i = next;
+                        continue;
+                    }
+                }
+            } else if source[i..].starts_with(b"import") {
+                let mut cursor = Self::skip_ascii_space(source, i + b"import".len());
+                if source.get(cursor) == Some(&b'(') {
+                    cursor = Self::skip_ascii_space(source, cursor + 1);
+                    if let Some((specifier, next)) = Self::scan_string_literal_after(source, cursor)
+                    {
+                        Self::push_unique_module(&mut modules, specifier);
+                        i = next;
+                        continue;
+                    }
+                } else if source.get(cursor) == Some(&b'\'') || source.get(cursor) == Some(&b'"') {
+                    if let Some((specifier, next)) = Self::scan_string_literal_after(source, cursor)
+                    {
+                        Self::push_unique_module(&mut modules, specifier);
+                        i = next;
+                        continue;
+                    }
+                } else if let Some(from_index) = strings::index_of(&source[cursor..], b"from") {
+                    cursor = Self::skip_ascii_space(source, cursor + from_index + b"from".len());
+                    if let Some((specifier, next)) = Self::scan_string_literal_after(source, cursor)
+                    {
+                        Self::push_unique_module(&mut modules, specifier);
+                        i = next;
+                        continue;
+                    }
+                }
+            }
+
+            i += 1;
+        }
+        modules
+    }
+
+    fn module_exists_in_node_modules(node_modules: &Path, module: &[u8]) -> bool {
+        let module = String::from_utf8_lossy(module);
+        node_modules.join(module.as_ref()).exists()
+    }
+
+    fn collect_missing_static_modules(
+        passthrough: &[Box<[u8]>],
+        project_node_modules: &Path,
+        cache_node_modules: &Path,
+    ) -> Vec<Vec<u8>> {
+        let Some(entry) = passthrough.first() else {
+            return Vec::new();
+        };
+        if entry.starts_with(b"-") || entry.contains(&0) {
+            return Vec::new();
+        }
+
+        let entry_path = PathBuf::from(String::from_utf8_lossy(entry).as_ref());
+        let Ok(source) = std::fs::read(entry_path) else {
+            return Vec::new();
+        };
+
+        let mut missing = Vec::new();
+        for module in Self::scan_static_bare_imports(&source) {
+            if Self::module_exists_in_node_modules(project_node_modules, &module)
+                || Self::module_exists_in_node_modules(cache_node_modules, &module)
+            {
+                continue;
+            }
+            if !missing.iter().any(|existing| existing == &module) {
+                missing.push(module);
+            }
+        }
+        missing
+    }
+
+    fn push_missing_if_not_cached(
+        missing: &mut Vec<Vec<u8>>,
+        project_node_modules: &Path,
+        cache_node_modules: &Path,
+        module: &[u8],
+    ) {
+        let Some(package_name) = Self::package_name_from_specifier(module) else {
+            return;
+        };
+        if Self::module_exists_in_node_modules(project_node_modules, &package_name)
+            || Self::module_exists_in_node_modules(cache_node_modules, &package_name)
+            || missing.iter().any(|existing| existing == &package_name)
+        {
+            return;
+        }
+        missing.push(package_name);
+    }
+
+    fn scan_package_json_dependency_section(source: &[u8], section: &[u8]) -> Vec<Vec<u8>> {
+        let mut pattern = Vec::with_capacity(section.len() + 2);
+        pattern.push(b'"');
+        pattern.extend_from_slice(section);
+        pattern.push(b'"');
+
+        let Some(mut cursor) =
+            strings::index_of(source, &pattern).map(|index| index + pattern.len())
+        else {
+            return Vec::new();
+        };
+        cursor = Self::skip_ascii_space(source, cursor);
+        if source.get(cursor) != Some(&b':') {
+            return Vec::new();
+        }
+        cursor = Self::skip_ascii_space(source, cursor + 1);
+        if source.get(cursor) != Some(&b'{') {
+            return Vec::new();
+        }
+        cursor += 1;
+
+        let mut modules = Vec::new();
+        let mut depth = 1usize;
+        while cursor < source.len() && depth > 0 {
+            match source[cursor] {
+                b'"' => {
+                    let Some((string, next)) = Self::scan_string_literal_after(source, cursor)
+                    else {
+                        break;
+                    };
+                    if depth == 1 {
+                        let after_key = Self::skip_ascii_space(source, next);
+                        if source.get(after_key) == Some(&b':') {
+                            Self::push_unique_module(&mut modules, string);
+                        }
+                    }
+                    cursor = next;
+                    continue;
+                }
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            cursor += 1;
+        }
+
+        modules
+    }
+
+    fn collect_missing_package_json_modules(
+        project_node_modules: &Path,
+        cache_node_modules: &Path,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let Ok(package_json) = std::fs::read("package.json") else {
+            return (Vec::new(), Vec::new());
+        };
+
+        let mut dependencies = Vec::new();
+        for module in Self::scan_package_json_dependency_section(&package_json, b"dependencies") {
+            Self::push_missing_if_not_cached(
+                &mut dependencies,
+                project_node_modules,
+                cache_node_modules,
+                &module,
+            );
+        }
+
+        let mut dev_dependencies = Vec::new();
+        for module in Self::scan_package_json_dependency_section(&package_json, b"devDependencies")
+        {
+            Self::push_missing_if_not_cached(
+                &mut dev_dependencies,
+                project_node_modules,
+                cache_node_modules,
+                &module,
+            );
+        }
+
+        (dependencies, dev_dependencies)
+    }
+
+    fn install_dependency_groups_parallel(
+        bun_exe: &Path,
+        bunx_home: &Path,
+        dependencies: &[Vec<u8>],
+        dev_dependencies: &[Vec<u8>],
+    ) -> Result<(), (Vec<u8>, String)> {
+        if dependencies.is_empty() && dev_dependencies.is_empty() {
+            return Ok(());
+        }
+
+        let bun_exe_for_dependencies = bun_exe.to_path_buf();
+        let bunx_home_for_dependencies = bunx_home.to_path_buf();
+        let dependencies = dependencies.to_vec();
+        let dependency_worker = thread::spawn(move || {
+            Self::install_resilient_modules_parallel(
+                &bun_exe_for_dependencies,
+                &bunx_home_for_dependencies,
+                &dependencies,
+            )
+        });
+
+        let bun_exe_for_dev_dependencies = bun_exe.to_path_buf();
+        let bunx_home_for_dev_dependencies = bunx_home.to_path_buf();
+        let dev_dependencies = dev_dependencies.to_vec();
+        let dev_dependency_worker = thread::spawn(move || {
+            Self::install_resilient_modules_parallel(
+                &bun_exe_for_dev_dependencies,
+                &bunx_home_for_dev_dependencies,
+                &dev_dependencies,
+            )
+        });
+
+        match dependency_worker.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err((
+                    b"<dependencies>".to_vec(),
+                    "install worker panicked".to_string(),
+                ));
+            }
+        }
+
+        match dev_dependency_worker.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err((
+                b"<devDependencies>".to_vec(),
+                "install worker panicked".to_string(),
+            )),
+        }
+    }
+
+    fn extract_quoted_after<'a>(stderr: &'a [u8], needle: &[u8]) -> Option<&'a [u8]> {
+        let start = strings::index_of(stderr, needle)? + needle.len();
+        let quote = stderr.get(start).copied()?;
+        if quote != b'\'' && quote != b'\"' {
+            return None;
+        }
+        let rest = &stderr[start + 1..];
+        let end = rest.iter().position(|b| *b == quote)?;
+        let module = &rest[..end];
+        if Self::is_bare_module_specifier(module) {
+            Some(module)
+        } else {
+            None
+        }
+    }
+
+    fn extract_missing_module(stderr: &[u8]) -> Option<Vec<u8>> {
+        Self::extract_quoted_after(stderr, b"Cannot find module ")
+            .or_else(|| Self::extract_quoted_after(stderr, b"Cannot find package "))
+            .and_then(Self::package_name_from_specifier)
+    }
+
+    fn read_resilience_records(db_path: &Path, project_hash: u64) -> Vec<Vec<u8>> {
+        let Ok(bytes) = std::fs::read(db_path) else {
+            return Vec::new();
+        };
+        if bytes.len() < Self::RESILIENCE_DB_MAGIC.len()
+            || &bytes[..Self::RESILIENCE_DB_MAGIC.len()] != Self::RESILIENCE_DB_MAGIC
+        {
+            return Vec::new();
+        }
+
+        let mut modules: Vec<Vec<u8>> = Vec::new();
+        let mut i = Self::RESILIENCE_DB_MAGIC.len();
+        while i + 14 <= bytes.len() {
+            let hash_bytes: [u8; 8] = match bytes[i..i + 8].try_into() {
+                Ok(bytes) => bytes,
+                Err(_) => break,
+            };
+            i += 8;
+            let dependent_len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+            i += 2;
+            let required_len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+            i += 2;
+            let version_len = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
+            i += 2;
+            let Some(record_len) = dependent_len
+                .checked_add(required_len)
+                .and_then(|len| len.checked_add(version_len))
+            else {
+                break;
+            };
+            if i + record_len > bytes.len() {
+                break;
+            }
+            let stored_project_hash = u64::from_le_bytes(hash_bytes);
+            let required_start = i + dependent_len;
+            let required_end = required_start + required_len;
+            if stored_project_hash == project_hash {
+                let module = &bytes[required_start..required_end];
+                if Self::is_bare_module_specifier(module) && !modules.iter().any(|m| m == module) {
+                    modules.push(module.to_vec());
+                }
+            }
+            i += record_len;
+        }
+
+        modules
+    }
+
+    fn append_resilience_record(
+        db_path: &Path,
+        project_hash: u64,
+        dependent_module: &[u8],
+        required_module: &[u8],
+        resolved_version: &[u8],
+    ) {
+        if dependent_module.len() > u16::MAX as usize
+            || required_module.len() > u16::MAX as usize
+            || resolved_version.len() > u16::MAX as usize
+        {
+            return;
+        }
+
+        let needs_magic = std::fs::metadata(db_path).map_or(true, |meta| meta.len() == 0);
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(db_path)
+        else {
+            return;
+        };
+        if needs_magic && file.write_all(Self::RESILIENCE_DB_MAGIC).is_err() {
+            return;
+        }
+        let _ = file.write_all(&project_hash.to_le_bytes());
+        let _ = file.write_all(&(dependent_module.len() as u16).to_le_bytes());
+        let _ = file.write_all(&(required_module.len() as u16).to_le_bytes());
+        let _ = file.write_all(&(resolved_version.len() as u16).to_le_bytes());
+        let _ = file.write_all(dependent_module);
+        let _ = file.write_all(required_module);
+        let _ = file.write_all(resolved_version);
+    }
+
+    fn link_cached_module(project_node_modules: &Path, cache_node_modules: &Path, module: &[u8]) {
+        let module = String::from_utf8_lossy(module);
+        let source = cache_node_modules.join(module.as_ref());
+        if !source.exists() {
+            return;
+        }
+        let destination = project_node_modules.join(module.as_ref());
+        if destination.exists() {
+            return;
+        }
+        if let Some(parent) = destination.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&source, &destination);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::os::windows::fs::symlink_dir(&source, &destination);
+        }
+    }
+
+    fn spawn_resilient_run_once(
+        bun_exe: &Path,
+        passthrough: &[Box<[u8]>],
+        node_path: &std::ffi::OsStr,
+    ) -> std::io::Result<(std_process::ExitStatus, Vec<u8>)> {
+        let mut command = std_process::Command::new(bun_exe);
+        command.arg("run");
+        for arg in passthrough {
+            command.arg(String::from_utf8_lossy(arg).as_ref());
+        }
+        command
+            .env("NODE_PATH", node_path)
+            .stdin(std_process::Stdio::inherit())
+            .stdout(std_process::Stdio::inherit())
+            .stderr(std_process::Stdio::piped());
+
+        let mut child = command.spawn()?;
+        let mut stderr = Vec::with_capacity(4096);
+        if let Some(mut pipe) = child.stderr.take() {
+            let mut buffer = [0u8; 8192];
+            loop {
+                let read = pipe.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                let remaining = Self::MAX_CAPTURED_STDERR.saturating_sub(stderr.len());
+                if remaining > 0 {
+                    stderr.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+            }
+        }
+        let status = child.wait()?;
+        Ok((status, stderr))
+    }
+
+    fn install_resilient_module(
+        bun_exe: &Path,
+        bunx_home: &Path,
+        module: &[u8],
+    ) -> std::io::Result<std_process::ExitStatus> {
+        std::fs::create_dir_all(bunx_home)?;
+        let package_json = bunx_home.join("package.json");
+        if !package_json.exists() {
+            std::fs::write(&package_json, b"{\"private\":true,\"dependencies\":{}}\n")?;
+        }
+
+        let mut command = std_process::Command::new(bun_exe);
+        command
+            .arg("add")
+            .arg("--no-save")
+            .arg(String::from_utf8_lossy(module).as_ref())
+            .current_dir(bunx_home)
+            .stdin(std_process::Stdio::inherit())
+            .stdout(std_process::Stdio::inherit())
+            .stderr(std_process::Stdio::inherit());
+        command.status()
+    }
+
+    fn install_resilient_modules_parallel(
+        bun_exe: &Path,
+        bunx_home: &Path,
+        modules: &[Vec<u8>],
+    ) -> Result<(), (Vec<u8>, String)> {
+        if modules.is_empty() {
+            return Ok(());
+        }
+
+        let queue = Arc::new(Mutex::new(VecDeque::from(modules.to_vec())));
+        let first_error: Arc<Mutex<Option<(Vec<u8>, String)>>> = Arc::new(Mutex::new(None));
+        let worker_count = modules.len().min(Self::max_parallel_resilience_installs());
+        let mut workers = Vec::with_capacity(worker_count);
+
+        for _ in 0..worker_count {
+            let queue = Arc::clone(&queue);
+            let first_error = Arc::clone(&first_error);
+            let bun_exe = bun_exe.to_path_buf();
+            let bunx_home = bunx_home.to_path_buf();
+
+            workers.push(thread::spawn(move || {
+                loop {
+                    if first_error.lock().map_or(true, |error| error.is_some()) {
+                        break;
+                    }
+
+                    let Some(module) = queue.lock().ok().and_then(|mut queue| queue.pop_front())
+                    else {
+                        break;
+                    };
+
+                    match Self::install_resilient_module(&bun_exe, &bunx_home, &module) {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            let message =
+                                format!("install exited with {}", Self::exit_status_code(status));
+                            if let Ok(mut error) = first_error.lock() {
+                                if error.is_none() {
+                                    *error = Some((module, message));
+                                }
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            if let Ok(mut error) = first_error.lock() {
+                                if error.is_none() {
+                                    *error = Some((module, err.to_string()));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            if worker.join().is_err() {
+                return Err((b"<worker>".to_vec(), "install worker panicked".to_string()));
+            }
+        }
+
+        match Arc::try_unwrap(first_error)
+            .ok()
+            .and_then(|mutex| mutex.into_inner().ok())
+            .flatten()
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn directory_size(path: &Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        if !metadata.is_dir() {
+            return 0;
+        }
+
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| Self::directory_size(&entry.path()))
+            .sum()
+    }
+
+    fn count_cache_packages(cache_node_modules: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(cache_node_modules) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(scoped_entries) = std::fs::read_dir(path) {
+                    count += scoped_entries.filter_map(Result::ok).count();
+                }
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn print_cache_packages(cache_node_modules: &Path) {
+        let Ok(entries) = std::fs::read_dir(cache_node_modules) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(scoped_entries) = std::fs::read_dir(path) {
+                    for scoped in scoped_entries.filter_map(Result::ok) {
+                        println!("{}/{}", name, scoped.file_name().to_string_lossy());
+                    }
+                }
+            } else {
+                println!("{}", name);
+            }
+        }
+    }
+
+    fn exec_resilient_cache(opts: &Options) -> ! {
+        let Some(bunx_home) = Self::bunx_home_dir().map(|path| path.join(".bunx")) else {
+            Output::err_generic(
+                "bunx cache requires HOME or BUNX_HOME to locate ~/.bunx",
+                format_args!(""),
+            );
+            Global::exit(1);
+        };
+        let cache_node_modules = bunx_home.join("node_modules");
+        let command = opts
+            .passthrough_list
+            .first()
+            .map(|value| value.as_ref())
+            .unwrap_or(b"info".as_slice());
+
+        match command {
+            b"dir" | b"path" => {
+                println!("{}", bunx_home.display());
+                Global::exit(0);
+            }
+            b"list" | b"ls" => {
+                Self::print_cache_packages(&cache_node_modules);
+                Global::exit(0);
+            }
+            b"clean" | b"prune" => {
+                if bunx_home.exists() {
+                    if let Err(err) = std::fs::remove_dir_all(&bunx_home) {
+                        Output::err_generic(
+                            "failed to remove bunx cache <b>{}<r>: {}",
+                            (bunx_home.display(), err),
+                        );
+                        Global::exit(1);
+                    }
+                }
+                println!("removed {}", bunx_home.display());
+                Global::exit(0);
+            }
+            b"info" | b"stats" => {
+                println!("path: {}", bunx_home.display());
+                println!(
+                    "packages: {}",
+                    Self::count_cache_packages(&cache_node_modules)
+                );
+                println!("bytes: {}", Self::directory_size(&bunx_home));
+                println!("concurrency: {}", Self::max_parallel_resilience_installs());
+                Global::exit(0);
+            }
+            _ => {
+                Output::err_generic(
+                    "unknown bunx cache command <b>{}<r>. Expected one of: info, dir, list, clean",
+                    format_args!("{}", BStr::new(command)),
+                );
+                Global::exit(1);
+            }
+        }
+    }
+
+    fn exec_resilient_run(opts: &Options) -> ! {
+        if opts.passthrough_list.is_empty() {
+            Self::exit_with_usage();
+        }
+
+        let bun_exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(err) => {
+                Output::err_generic(
+                    "bunx run failed to locate current executable",
+                    format_args!("{}", err),
+                );
+                Global::exit(1);
+            }
+        };
+        let Some(bunx_home) = Self::bunx_home_dir().map(|path| path.join(".bunx")) else {
+            Output::err_generic(
+                "bunx run requires HOME or BUNX_HOME to locate ~/.bunx",
+                format_args!(""),
+            );
+            Global::exit(1);
+        };
+
+        let cache_node_modules = bunx_home.join("node_modules");
+        let db_path = bunx_home.join("resilience.db");
+        let project_hash = Self::project_hash();
+        let project_node_modules = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("node_modules");
+
+        for module in Self::read_resilience_records(&db_path, project_hash) {
+            Self::link_cached_module(&project_node_modules, &cache_node_modules, &module);
+        }
+
+        let (mut dependency_modules, dev_dependency_modules) =
+            Self::collect_missing_package_json_modules(&project_node_modules, &cache_node_modules);
+        for module in Self::collect_missing_static_modules(
+            &opts.passthrough_list,
+            &project_node_modules,
+            &cache_node_modules,
+        ) {
+            if !dependency_modules
+                .iter()
+                .any(|existing| existing == &module)
+            {
+                dependency_modules.push(module);
+            }
+        }
+
+        if let Err((module, message)) = Self::install_dependency_groups_parallel(
+            &bun_exe,
+            &bunx_home,
+            &dependency_modules,
+            &dev_dependency_modules,
+        ) {
+            Output::err_generic(
+                "bunx run failed to install missing module <b>{}<r>: {}",
+                (BStr::new(&module), message),
+            );
+            Global::exit(1);
+        }
+        for module in dependency_modules
+            .iter()
+            .chain(dev_dependency_modules.iter())
+        {
+            Self::link_cached_module(&project_node_modules, &cache_node_modules, module);
+            Self::append_resilience_record(&db_path, project_hash, b"run", module, b"latest");
+        }
+
+        let node_path = Self::node_path_with_bunx_cache(&cache_node_modules);
+        let (status, stderr) =
+            match Self::spawn_resilient_run_once(&bun_exe, &opts.passthrough_list, &node_path) {
+                Ok(result) => result,
+                Err(err) => {
+                    Output::err_generic(
+                        "bunx run failed to spawn supervised process",
+                        format_args!("{}", err),
+                    );
+                    Global::exit(1);
+                }
+            };
+
+        if status.success() {
+            Global::exit(0);
+        }
+
+        let Some(module) = Self::extract_missing_module(&stderr) else {
+            let _ = std::io::stderr().write_all(&stderr);
+            Global::exit(Self::exit_status_code(status));
+        };
+
+        if let Err((failed_module, message)) = Self::install_resilient_modules_parallel(
+            &bun_exe,
+            &bunx_home,
+            core::slice::from_ref(&module),
+        ) {
+            let _ = std::io::stderr().write_all(&stderr);
+            Output::err_generic(
+                "bunx run failed to install missing module <b>{}<r>: {}",
+                (BStr::new(&failed_module), message),
+            );
+            Global::exit(1);
+        }
+
+        Self::link_cached_module(&project_node_modules, &cache_node_modules, &module);
+        Self::append_resilience_record(&db_path, project_hash, b"run", &module, b"latest");
+
+        match Self::spawn_resilient_run_once(&bun_exe, &opts.passthrough_list, &node_path) {
+            Ok((rerun_status, rerun_stderr)) => {
+                let _ = std::io::stderr().write_all(&rerun_stderr);
+                Global::exit(Self::exit_status_code(rerun_status));
+            }
+            Err(err) => {
+                Output::err_generic(
+                    "bunx run failed to restart supervised process",
+                    format_args!("{}", err),
+                );
+                Global::exit(1);
+            }
+        }
+    }
+
     fn exit_with_usage() -> ! {
         crate::cli::command::tag_print_help(Command::Tag::BunxCommand, false);
         Global::exit(1);
@@ -605,6 +1476,14 @@ impl BunxCommand {
         ctx.debug.silent = true;
 
         let opts = Options::parse(ctx, argv)?;
+
+        if opts.package_name == b"run" {
+            Self::exec_resilient_run(&opts);
+        }
+
+        if opts.package_name == b"cache" {
+            Self::exec_resilient_cache(&opts);
+        }
 
         let mut requests_buf = update_request::Array::with_capacity(64);
         // SAFETY: CLI dispatch is single-threaded and `ctx_log` is consumed by
