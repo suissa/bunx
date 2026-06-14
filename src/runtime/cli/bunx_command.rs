@@ -599,13 +599,22 @@ impl BunxCommand {
 
     const RESILIENCE_DB_MAGIC: &'static [u8; 8] = b"BUNXRS01";
     const MAX_CAPTURED_STDERR: usize = 64 * 1024;
-    const MAX_PARALLEL_RESILIENCE_INSTALLS: usize = 10;
+    const DEFAULT_MAX_PARALLEL_RESILIENCE_INSTALLS: usize = 10;
 
     fn exit_status_code(status: std_process::ExitStatus) -> u32 {
         status
             .code()
             .and_then(|code| u32::try_from(code).ok())
             .unwrap_or(1)
+    }
+
+    fn max_parallel_resilience_installs() -> usize {
+        std::env::var("BUNX_RESILIENCE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(64))
+            .unwrap_or(Self::DEFAULT_MAX_PARALLEL_RESILIENCE_INSTALLS)
     }
 
     fn bunx_home_dir() -> Option<PathBuf> {
@@ -1148,7 +1157,7 @@ impl BunxCommand {
 
         let queue = Arc::new(Mutex::new(VecDeque::from(modules.to_vec())));
         let first_error: Arc<Mutex<Option<(Vec<u8>, String)>>> = Arc::new(Mutex::new(None));
-        let worker_count = modules.len().min(Self::MAX_PARALLEL_RESILIENCE_INSTALLS);
+        let worker_count = modules.len().min(Self::max_parallel_resilience_installs());
         let mut workers = Vec::with_capacity(worker_count);
 
         for _ in 0..worker_count {
@@ -1206,6 +1215,129 @@ impl BunxCommand {
         {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    fn directory_size(path: &Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        if !metadata.is_dir() {
+            return 0;
+        }
+
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| Self::directory_size(&entry.path()))
+            .sum()
+    }
+
+    fn count_cache_packages(cache_node_modules: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(cache_node_modules) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(scoped_entries) = std::fs::read_dir(path) {
+                    count += scoped_entries.filter_map(Result::ok).count();
+                }
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn print_cache_packages(cache_node_modules: &Path) {
+        let Ok(entries) = std::fs::read_dir(cache_node_modules) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') {
+                continue;
+            }
+            if name.starts_with('@') {
+                if let Ok(scoped_entries) = std::fs::read_dir(path) {
+                    for scoped in scoped_entries.filter_map(Result::ok) {
+                        println!("{}/{}", name, scoped.file_name().to_string_lossy());
+                    }
+                }
+            } else {
+                println!("{}", name);
+            }
+        }
+    }
+
+    fn exec_resilient_cache(opts: &Options) -> ! {
+        let Some(bunx_home) = Self::bunx_home_dir().map(|path| path.join(".bunx")) else {
+            Output::err_generic(
+                "bunx cache requires HOME or BUNX_HOME to locate ~/.bunx",
+                format_args!(""),
+            );
+            Global::exit(1);
+        };
+        let cache_node_modules = bunx_home.join("node_modules");
+        let command = opts
+            .passthrough_list
+            .first()
+            .map(|value| value.as_ref())
+            .unwrap_or(b"info".as_slice());
+
+        match command {
+            b"dir" | b"path" => {
+                println!("{}", bunx_home.display());
+                Global::exit(0);
+            }
+            b"list" | b"ls" => {
+                Self::print_cache_packages(&cache_node_modules);
+                Global::exit(0);
+            }
+            b"clean" | b"prune" => {
+                if bunx_home.exists() {
+                    if let Err(err) = std::fs::remove_dir_all(&bunx_home) {
+                        Output::err_generic(
+                            "failed to remove bunx cache <b>{}<r>: {}",
+                            (bunx_home.display(), err),
+                        );
+                        Global::exit(1);
+                    }
+                }
+                println!("removed {}", bunx_home.display());
+                Global::exit(0);
+            }
+            b"info" | b"stats" => {
+                println!("path: {}", bunx_home.display());
+                println!(
+                    "packages: {}",
+                    Self::count_cache_packages(&cache_node_modules)
+                );
+                println!("bytes: {}", Self::directory_size(&bunx_home));
+                println!("concurrency: {}", Self::max_parallel_resilience_installs());
+                Global::exit(0);
+            }
+            _ => {
+                Output::err_generic(
+                    "unknown bunx cache command <b>{}<r>. Expected one of: info, dir, list, clean",
+                    format_args!("{}", BStr::new(command)),
+                );
+                Global::exit(1);
+            }
         }
     }
 
@@ -1347,6 +1479,10 @@ impl BunxCommand {
 
         if opts.package_name == b"run" {
             Self::exec_resilient_run(&opts);
+        }
+
+        if opts.package_name == b"cache" {
+            Self::exec_resilient_cache(&opts);
         }
 
         let mut requests_buf = update_request::Array::with_capacity(64);
