@@ -1,0 +1,8 @@
+{
+  "implementation": "zig",
+  "binary": "/workspace/bunx/bunestro/zig/zig-out/bin/bunestro-zig",
+  "generated_at_unix": 1781544369,
+  "package_json": "/workspace/bunx/bunestro/examples/package.json",
+  "scenarios": [],
+  "build_error": "binary not found: /workspace/bunx/bunestro/zig/zig-out/bin/bunestro-zig"
+}

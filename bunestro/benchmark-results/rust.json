@@ -1,0 +1,82 @@
+{
+  "implementation": "rust",
+  "binary": "/workspace/bunx/bunestro/rust/target/release/bunestro",
+  "generated_at_unix": 1781544358,
+  "package_json": "/workspace/bunx/bunestro/examples/package.json",
+  "scenarios": [
+    {
+      "name": "cold_install",
+      "argv": [
+        "/workspace/bunx/bunestro/rust/target/release/bunestro",
+        "install",
+        "--package-json",
+        "/tmp/bunestro-rust-work-inqcq70f/package.json"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 1803.167,
+      "user_cpu_ms": 1650.044,
+      "system_cpu_ms": 1702.6,
+      "cpu_percent_estimate": 185.93,
+      "max_rss_kib": 40776,
+      "stdout_bytes": 0,
+      "stderr_bytes": 186,
+      "stderr_tail": "Resolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [0]\nResolved, downloaded and extracted [0]\nResolving dependencies\nResolved, downloaded and extracted [0]\n"
+    },
+    {
+      "name": "cache_reuse_same_packages",
+      "argv": [
+        "/workspace/bunx/bunestro/rust/target/release/bunestro",
+        "install",
+        "--package-json",
+        "/tmp/bunestro-rust-work-inqcq70f/package.json"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 7.296,
+      "user_cpu_ms": 0.0,
+      "system_cpu_ms": 5.687,
+      "cpu_percent_estimate": 77.95,
+      "max_rss_kib": 0,
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "stderr_tail": ""
+    },
+    {
+      "name": "automatic_package_update",
+      "argv": [
+        "/workspace/bunx/bunestro/rust/target/release/bunestro",
+        "install",
+        "--update",
+        "--package-json",
+        "/tmp/bunestro-rust-work-inqcq70f/package.json"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 8701.628,
+      "user_cpu_ms": 7690.453,
+      "system_cpu_ms": 5776.407,
+      "cpu_percent_estimate": 154.76,
+      "max_rss_kib": 87636,
+      "stdout_bytes": 0,
+      "stderr_bytes": 2493,
+      "stderr_tail": "\nResolved, downloaded and extracted [6]\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [48]\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolved, downloaded and extracted [8]\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolved, downloaded and extracted [58]\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [54]\nResolving dependencies\nResolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [136]\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [18]\nResolved, downloaded and extracted [92]\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolved, downloaded and extracted [6]\nResolving dependencies\nResolved, downloaded and extracted [26]\nResolving dependencies\nResolved, downloaded and extracted [92]\nResolved, downloaded and extracted [4]\nResolving dependencies\nResolved, downloaded and extracted [150]\nResolved, downloaded and extracted [2]\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [64]\nResolved, downloaded and extracted [6]\nResolving dependencies\nResolving dependencies\nResolving dependencies\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [2]\nResolved, downloaded and extracted [44]\nResolved, downloaded and extracted [2]\n"
+    },
+    {
+      "name": "cache_info",
+      "argv": [
+        "/workspace/bunx/bunestro/rust/target/release/bunestro",
+        "cache",
+        "info"
+      ],
+      "exit_code": 0,
+      "elapsed_ms": 70.883,
+      "user_cpu_ms": 12.317,
+      "system_cpu_ms": 57.479,
+      "cpu_percent_estimate": 98.47,
+      "max_rss_kib": 0,
+      "stdout_bytes": 86,
+      "stderr_bytes": 0,
+      "stderr_tail": ""
+    }
+  ],
+  "workdir": "/tmp/bunestro-rust-work-inqcq70f",
+  "cache_dir": "/tmp/bunestro-rust-cache-qqv5of5h"
+}

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bunestro Benchmark Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="min-h-screen bg-neutral-950 text-neutral-100">
+    <main class="mx-auto max-w-7xl px-6 py-8">
+      <header class="mb-8 flex flex-col gap-3 border-b border-neutral-800 pb-6">
+        <p class="text-sm uppercase tracking-[0.4em] text-emerald-400">bun + maestro</p>
+        <h1 class="text-4xl font-black tracking-tight">Bunestro Rust vs Zig</h1>
+        <p class="max-w-3xl text-neutral-400">
+          Side-by-side benchmark dashboard for cold installs, cache reuse, automatic updates, CPU, RAM, elapsed time,
+          stdout/stderr volume, and cache stats.
+        </p>
+      </header>
+
+      <section id="summary" class="mb-8 grid gap-4 md:grid-cols-4"></section>
+
+      <section class="grid gap-6 lg:grid-cols-2">
+        <article id="rust-card" class="rounded-3xl border border-orange-500/20 bg-neutral-900/80 p-5 shadow-2xl shadow-orange-950/20"></article>
+        <article id="zig-card" class="rounded-3xl border border-sky-500/20 bg-neutral-900/80 p-5 shadow-2xl shadow-sky-950/20"></article>
+      </section>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
