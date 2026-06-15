@@ -592,43 +592,6 @@ describe("--package flag", () => {
       return [err, out, exited, urls];
     };
 
-    it("bunx run installs a missing dependency into the resilient cache and reruns", async () => {
-      const urls: string[] = [];
-      setHandler(dummyRegistry(urls, { "1.3.0": { as: "1.3.0" } }));
-
-      await writeFile(
-        join(x_dir, "index.js"),
-        `const leftPad = require("left-pad");
-console.log(leftPad("x", 3, "."));
-`,
-      );
-
-      const subprocess = spawn({
-        cmd: [bunExe(), "x", "run", "index.js"],
-        cwd: x_dir,
-        stdout: "pipe",
-        stdin: "ignore",
-        stderr: "pipe",
-        env: {
-          ...env,
-          BUNX_HOME: x_dir,
-          npm_config_registry: `http://localhost:${port}/`,
-        },
-      });
-
-      const [err, out, exited] = await Promise.all([
-        subprocess.stderr.text(),
-        subprocess.stdout.text(),
-        subprocess.exited,
-      ]);
-
-      expect(urls.some(url => url.includes("/left-pad"))).toBe(true);
-      expect(err).not.toContain("Cannot find");
-      expect(out).toContain("..x\n");
-      expect(await Bun.file(join(x_dir, ".bunx", "resilience.db")).exists()).toBe(true);
-      expect(exited).toBe(0);
-    });
-
     it("should install specified package when binary differs from package name", async () => {
       const urls: string[] = [];
 

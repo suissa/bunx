@@ -44,7 +44,7 @@ const checks = {
   queryClient: typeof QueryClient,
   axios: typeof axios.get,
   chalk: chalk.green("ok"),
-  commander: new Command().name("bunx-cache-example").name(),
+  commander: new Command().name("bunestro-cache-example").name(),
   dateFns: formatISO(new Date(0)),
   dotenv: typeof dotenv.config,
   drizzle: typeof sql,

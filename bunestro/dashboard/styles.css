@@ -1,0 +1,28 @@
+.metric-card {
+  background: linear-gradient(180deg, rgba(38, 38, 38, 0.88), rgba(18, 18, 18, 0.96));
+  border: 1px solid rgba(115, 115, 115, 0.22);
+  border-radius: 1rem;
+  padding: 1rem;
+}
+.metric-label {
+  color: rgb(163 163 163);
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.metric-value {
+  font-size: 1.5rem;
+  font-weight: 900;
+}
+.scenario-row {
+  border-top: 1px solid rgba(64, 64, 64, 0.8);
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: minmax(0, 1.1fr) repeat(4, minmax(0, 0.8fr));
+  padding: 0.85rem 0;
+}
+@media (max-width: 720px) {
+  .scenario-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
